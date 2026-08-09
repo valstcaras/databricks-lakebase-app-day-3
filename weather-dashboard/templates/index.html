@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Weather Dashboard - Agent Bricks + Weather MCP</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; max-width: 1200px; margin: 40px auto; padding: 0 16px; background: #f5f5f5; }
+    h1 { font-size: 1.6rem; color: #1a73e8; }
+    h2 { font-size: 1.2rem; margin-top: 32px; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+    .card { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+    .card .label { color: #666; font-size: 0.85rem; margin-bottom: 8px; }
+    .card .value { font-size: 2rem; font-weight: 700; color: #1a73e8; }
+    .query-card { background: white; border-radius: 12px; padding: 20px; margin-bottom: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+    .query-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .tool-badge { display: inline-block; padding: 4px 12px; border-radius: 16px; font-size: 0.8rem; font-weight: 600; }
+    .tool-current { background: #e3f2fd; color: #1976d2; }
+    .tool-forecast { background: #f3e5f5; color: #7b1fa2; }
+    .tool-umbrella { background: #fff3e0; color: #e65100; }
+    .tool-travel { background: #e8f5e9; color: #2e7d32; }
+    .timestamp { color: #999; font-size: 0.85rem; }
+    .location { font-size: 1.1rem; font-weight: 600; color: #333; margin-bottom: 8px; }
+    .weather-icon { font-size: 2rem; margin-right: 8px; }
+    .result-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-top: 12px; }
+    .result-item { font-size: 0.9rem; }
+    .result-label { color: #666; font-size: 0.8rem; }
+    .result-value { font-weight: 600; color: #333; }
+    #refresh { padding: 8px 16px; background: #1a73e8; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9rem; }
+    #refresh:hover { background: #1557b0; }
+    .top-location { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #eee; }
+    .no-queries { text-align: center; color: #999; padding: 40px; background: white; border-radius: 12px; }
+  </style>
+</head>
+<body>
+  <h1>🌤️ Weather Dashboard</h1>
+  <p>Monitoring weather queries from Agent Bricks through the Weather MCP server.
+     <button id="refresh">Refresh</button></p>
+
+  <div class="cards">
+    <div class="card">
+      <div class="label">Total Queries</div>
+      <div class="value" id="total-queries">0</div>
+    </div>
+    <div class="card">
+      <div class="label">Current Weather</div>
+      <div class="value" id="current-count">0</div>
+    </div>
+    <div class="card">
+      <div class="label">Forecasts</div>
+      <div class="value" id="forecast-count">0</div>
+    </div>
+    <div class="card">
+      <div class="label">Umbrella Checks</div>
+      <div class="value" id="umbrella-count">0</div>
+    </div>
+    <div class="card">
+      <div class="label">Travel Recs</div>
+      <div class="value" id="travel-count">0</div>
+    </div>
+  </div>
+
+  <h2>📍 Top Locations</h2>
+  <div class="card">
+    <div id="top-locations"></div>
+  </div>
+
+  <h2>📋 Recent Queries</h2>
+  <div id="queries-container">
+    <div class="no-queries">No queries yet. Queries will appear here as the agent uses the Weather MCP server.</div>
+  </div>
+
+  <script>
+    const toolIcons = {
+      'get_current_weather': '🌡️',
+      'get_forecast': '📅',
+      'predict_umbrella_needed': '☂️',
+      'get_travel_recommendation': '✈️'
+    };
+
+    const toolClasses = {
+      'get_current_weather': 'tool-current',
+      'get_forecast': 'tool-forecast',
+      'predict_umbrella_needed': 'tool-umbrella',
+      'get_travel_recommendation': 'tool-travel'
+    };
+
+    function formatTimestamp(ts) {
+      return new Date(ts).toLocaleString();
+    }
+
+    function renderQuery(query) {
+      const tool = query.tool_name || 'unknown';
+      const icon = toolIcons[tool] || '❓';
+      const badgeClass = toolClasses[tool] || 'tool-current';
+      const location = query.location || 'Unknown';
+      const result = query.result || {};
+
+      let resultHtml = '';
+      if (tool === 'get_current_weather' && result.temperature !== undefined) {
+        resultHtml = `
+          <div class="result-grid">
+            <div class="result-item"><div class="result-label">Temperature</div><div class="result-value">${result.temperature_f}°F</div></div>
+            <div class="result-item"><div class="result-label">Conditions</div><div class="result-value">${result.conditions}</div></div>
+            <div class="result-item"><div class="result-label">Humidity</div><div class="result-value">${result.humidity}%</div></div>
+            <div class="result-item"><div class="result-label">Wind</div><div class="result-value">${result.wind_speed_mph} mph</div></div>
+          </div>`;
+      } else if (tool === 'get_forecast' && result.forecast_days) {
+        const days = result.forecast_days.length;
+        resultHtml = `<div class="result-value">Forecast for ${days} days</div>`;
+      } else if (tool === 'predict_umbrella_needed' && result.umbrella_needed !== undefined) {
+        const icon = result.umbrella_needed ? '☂️ Yes' : '☀️ No';
+        const precip = result.weather_details?.precipitation_probability || 0;
+        resultHtml = `
+          <div class="result-grid">
+            <div class="result-item"><div class="result-label">Umbrella Needed</div><div class="result-value">${icon}</div></div>
+            <div class="result-item"><div class="result-label">Precipitation</div><div class="result-value">${precip}%</div></div>
+          </div>`;
+      } else if (tool === 'get_travel_recommendation' && result.travel_score !== undefined) {
+        resultHtml = `
+          <div class="result-grid">
+            <div class="result-item"><div class="result-label">Travel Score</div><div class="result-value">${result.travel_score}/10</div></div>
+            <div class="result-item"><div class="result-label">Recommendation</div><div class="result-value">${result.overall_recommendation}</div></div>
+          </div>`;
+      }
+
+      return `
+        <div class="query-card">
+          <div class="query-header">
+            <div>
+              <span class="weather-icon">${icon}</span>
+              <span class="tool-badge ${badgeClass}">${tool}</span>
+            </div>
+            <span class="timestamp">${formatTimestamp(query.timestamp)}</span>
+          </div>
+          <div class="location">📍 ${location}</div>
+          ${resultHtml}
+        </div>`;
+    }
+
+    async function refresh() {
+      try {
+        const [stats, queries] = await Promise.all([
+          fetch('/api/stats').then(r => r.json()),
+          fetch('/api/queries?limit=20').then(r => r.json())
+        ]);
+
+        // Update stats cards
+        document.getElementById('total-queries').textContent = stats.total_queries || 0;
+        document.getElementById('current-count').textContent = stats.tool_counts?.get_current_weather || 0;
+        document.getElementById('forecast-count').textContent = stats.tool_counts?.get_forecast || 0;
+        document.getElementById('umbrella-count').textContent = stats.tool_counts?.predict_umbrella_needed || 0;
+        document.getElementById('travel-count').textContent = stats.tool_counts?.get_travel_recommendation || 0;
+
+        // Update top locations
+        const topLocations = document.getElementById('top-locations');
+        if (stats.top_locations && stats.top_locations.length > 0) {
+          topLocations.innerHTML = stats.top_locations.map(loc => 
+            `<div class="top-location">
+              <span>📍 ${loc.location}</span>
+              <span>${loc.count} queries</span>
+            </div>`
+          ).join('');
+        } else {
+          topLocations.innerHTML = '<div style="color: #999; text-align: center; padding: 20px;">No locations yet</div>';
+        }
+
+        // Update queries
+        const container = document.getElementById('queries-container');
+        if (queries && queries.length > 0) {
+          container.innerHTML = queries.map(renderQuery).join('');
+        } else {
+          container.innerHTML = '<div class="no-queries">No queries yet. Queries will appear here as the agent uses the Weather MCP server.</div>';
+        }
+      } catch (err) {
+        console.error('Failed to refresh:', err);
+      }
+    }
+
+    document.getElementById('refresh').addEventListener('click', refresh);
+    refresh();
+    setInterval(refresh, 5000);  // Auto-refresh every 5 seconds
+  </script>
+</body>
+</html>

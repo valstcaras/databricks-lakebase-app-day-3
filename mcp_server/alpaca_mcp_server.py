@@ -4,12 +4,26 @@ Alpaca Markets paper-trading MCP server.
 Exposes paper-trading tools over MCP (Model Context Protocol) so a
 Databricks Agent Bricks agent can call them like any other tool:
     - get_quote(symbol)
-    - place_trade(account_id, symbol, side, quantity)
+    - stage_trade(account_id, symbol, side, quantity)
+    - execute_trade(confirmation_code)
     - get_positions(account_id)
     - get_account_summary(account_id)
     - get_order_history(account_id, limit)
     - get_balance(account_id)
     - get_current_user()
+    - add_to_watchlist(symbol, email)
+    - get_watchlist(limit, email)
+    - remove_from_watchlist(symbol)
+    - vector_search(query, limit, search_chunks)
+    - get_mcp_traces(session_id, limit)
+
+All MCP tool calls are automatically traced and stored in the
+mcp_tool_traces Lakebase table with:
+    - Unique session ID per request
+    - User email
+    - Tool name, input parameters, output results
+    - Execution duration and status
+    - Timestamps
 
 These tools are backed by Alpaca Markets' real, hosted paper-trading
 account (see alpaca_broker.py), so students can safely wire an Agent
@@ -36,7 +50,13 @@ Run locally:
 
 import os
 import logging
+import random
+import uuid
+import json
+import time
+import functools
 from contextvars import ContextVar
+from datetime import datetime, timedelta
 
 from fastmcp import FastMCP
 from sentence_transformers import SentenceTransformer
@@ -70,6 +90,13 @@ EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-M
 # Context variable to store request headers for accessing end-user identity
 _request_context: ContextVar[dict] = ContextVar('request_context', default={})
 
+# Context variable to store session ID for tracing
+_session_id: ContextVar[str] = ContextVar('session_id', default=None)
+
+# In-memory storage for staged trades with confirmation codes
+# Format: {code: {account_id, symbol, side, quantity, quote, staged_at}}
+_staged_trades: dict[str, dict] = {}
+
 
 def _get_end_user_email() -> str:
     """Get the actual end user's email from request headers, or fallback to service principal."""
@@ -85,23 +112,166 @@ def _get_end_user_email() -> str:
     return w.current_user.me().user_name or 'zach@dataexpert.io'
 
 
+def _init_tracing_table():
+    """Initialize the MCP tracing table in Lakebase if it doesn't exist."""
+    try:
+        sql = """
+        CREATE TABLE IF NOT EXISTS mcp_tool_traces (
+            id SERIAL PRIMARY KEY,
+            session_id VARCHAR(255) NOT NULL,
+            user_email VARCHAR(255),
+            tool_name VARCHAR(255) NOT NULL,
+            input_params JSONB,
+            output_result JSONB,
+            status VARCHAR(50) NOT NULL,
+            error_message TEXT,
+            duration_ms FLOAT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+        """
+        lakebase.run_write(sql, ())
+        logger.info("MCP tracing table initialized")
+    except Exception as e:
+        logger.warning(f"Failed to initialize tracing table: {e}")
+
+
+def _trace_tool_call(func):
+    """Decorator to trace MCP tool calls and store them in Lakebase.
+    
+    Wraps all tool results in a standardized format with:
+    - tool_name: Name of the tool that was executed
+    - status: 'success' or 'error'
+    - execution_time_ms: Duration of execution
+    - message: Brief description of the execution result
+    - result: The actual tool result (for success) or error details (for errors)
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        # Get session ID and user email
+        session_id = _session_id.get() or str(uuid.uuid4())
+        user_email = None
+        try:
+            user_email = _get_end_user_email()
+        except:
+            pass
+        
+        tool_name = func.__name__
+        start_time = time.time()
+        
+        # Capture input parameters
+        input_params = {
+            'args': [str(arg) for arg in args],
+            'kwargs': {k: str(v) for k, v in kwargs.items()}
+        }
+        
+        try:
+            # Execute the actual tool
+            result = func(*args, **kwargs)
+            duration_ms = (time.time() - start_time) * 1000
+            
+            # Create standardized response wrapper
+            standardized_result = {
+                "tool_name": tool_name,
+                "status": "success",
+                "execution_time_ms": round(duration_ms, 2),
+                "message": f"{tool_name} executed successfully",
+                "result": result
+            }
+            
+            # Store trace in Lakebase
+            try:
+                sql = """
+                INSERT INTO mcp_tool_traces 
+                (session_id, user_email, tool_name, input_params, output_result, status, duration_ms)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """
+                lakebase.run_write(
+                    sql,
+                    (
+                        session_id,
+                        user_email,
+                        tool_name,
+                        json.dumps(input_params),
+                        json.dumps(standardized_result),
+                        'success',
+                        duration_ms
+                    )
+                )
+            except Exception as trace_error:
+                logger.warning(f"Failed to store trace: {trace_error}")
+            
+            return standardized_result
+            
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            
+            # Create standardized error response
+            standardized_error = {
+                "tool_name": tool_name,
+                "status": "error",
+                "execution_time_ms": round(duration_ms, 2),
+                "message": f"{tool_name} failed: {str(e)}",
+                "error_details": {
+                    "error_type": type(e).__name__,
+                    "error_message": str(e)
+                }
+            }
+            
+            # Store error trace
+            try:
+                sql = """
+                INSERT INTO mcp_tool_traces 
+                (session_id, user_email, tool_name, input_params, output_result, status, error_message, duration_ms)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """
+                lakebase.run_write(
+                    sql,
+                    (
+                        session_id,
+                        user_email,
+                        tool_name,
+                        json.dumps(input_params),
+                        json.dumps(standardized_error),
+                        'error',
+                        str(e),
+                        duration_ms
+                    )
+                )
+            except Exception as trace_error:
+                logger.warning(f"Failed to store error trace: {trace_error}")
+            
+            # Return the standardized error instead of raising
+            return standardized_error
+    
+    return wrapper
+
+
 mcp = FastMCP("alpaca-paper-trading")
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
-    """Middleware to capture HTTP headers containing end-user identity."""
+    """Middleware to capture HTTP headers containing end-user identity and generate session IDs."""
     async def dispatch(self, request: Request, call_next):
+        # Generate a unique session ID for this request
+        session_id = str(uuid.uuid4())
+        _session_id.set(session_id)
+        
         # Capture headers that Databricks injects with user identity
         headers = {
             'x-forwarded-user': request.headers.get('x-forwarded-user'),
             'x-forwarded-email': request.headers.get('x-forwarded-email'),
         }
         _request_context.set(headers)
+        
+        # Log the session start
+        logger.info(f"New MCP session: {session_id} for user: {headers.get('x-forwarded-user', 'unknown')}")
+        
         response = await call_next(request)
         return response
 
 
 @mcp.tool
+@_trace_tool_call
 def get_quote(symbol: str) -> dict:
     """
     Get the latest real quote for a stock ticker symbol from Massive.com.
@@ -116,10 +286,14 @@ def get_quote(symbol: str) -> dict:
 
 
 @mcp.tool
-def place_trade(account_id: str, symbol: str, side: str, quantity: float) -> dict:
+@_trace_tool_call
+def stage_trade(account_id: str, symbol: str, side: str, quantity: float) -> dict:
     """
-    Place a real market order (paper trade) - BUY or SELL - against the
-    configured Alpaca paper trading account.
+    Stage a trade for review before execution. Gets a quote, calculates the
+    total cost, and generates a 5-digit confirmation code.
+    
+    The trade will NOT be executed until execute_trade is called with the
+    confirmation code. Staged trades expire after 10 minutes.
 
     Args:
         account_id: Accepted for signature compatibility; not used to
@@ -130,13 +304,119 @@ def place_trade(account_id: str, symbol: str, side: str, quantity: float) -> dic
         quantity: Number of shares to trade (must be positive).
 
     Returns:
-        A dict describing the order (id, symbol, side, quantity,
-        price, notional, status, created_at).
+        A dict with trade summary, estimated cost, and a 5-digit confirmation
+        code to use with execute_trade.
     """
-    return alpaca_broker.place_order(account_id, symbol, side, quantity)
+    try:
+        # Validate inputs
+        if side.upper() not in ["BUY", "SELL"]:
+            return {"status": "error", "message": "side must be BUY or SELL"}
+        if quantity <= 0:
+            return {"status": "error", "message": "quantity must be positive"}
+        
+        symbol = symbol.strip().upper()
+        side = side.upper()
+        
+        # Get current quote
+        quote = massive_broker.get_quote(symbol)
+        
+        # Calculate estimated cost
+        estimated_cost = quote["price"] * quantity
+        
+        # Generate 5-digit confirmation code
+        code = f"{random.randint(10000, 99999)}"
+        
+        # Store staged trade
+        _staged_trades[code] = {
+            "account_id": account_id,
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "quote": quote,
+            "staged_at": datetime.now(),
+            "estimated_cost": estimated_cost,
+        }
+        
+        return {
+            "status": "staged",
+            "confirmation_code": code,
+            "summary": {
+                "action": f"{side} {quantity} shares of {symbol}",
+                "current_price": quote["price"],
+                "estimated_cost": f"${estimated_cost:,.2f}",
+                "quote_as_of": quote["as_of"],
+            },
+            "message": f"Trade staged. To execute, call execute_trade with confirmation code: {code}",
+            "expires_in": "10 minutes",
+        }
+    except Exception as e:
+        logger.exception(f"Failed to stage trade for {symbol}")
+        return {
+            "status": "error",
+            "message": f"Failed to stage trade: {str(e)}",
+        }
 
 
 @mcp.tool
+@_trace_tool_call
+def execute_trade(confirmation_code: str) -> dict:
+    """
+    Execute a previously staged trade using its 5-digit confirmation code.
+    
+    This places a real market order (paper trade) against the configured
+    Alpaca paper trading account. The trade must have been staged first
+    using stage_trade.
+
+    Args:
+        confirmation_code: The 5-digit code returned by stage_trade.
+
+    Returns:
+        A dict describing the executed order (id, symbol, side, quantity,
+        price, notional, status, created_at) or an error if the code is
+        invalid or expired.
+    """
+    try:
+        # Verify confirmation code exists
+        if confirmation_code not in _staged_trades:
+            return {
+                "status": "error",
+                "message": "Invalid confirmation code. Please stage a trade first using stage_trade.",
+            }
+        
+        # Retrieve staged trade
+        staged = _staged_trades[confirmation_code]
+        
+        # Check if trade has expired (10 minutes)
+        if datetime.now() - staged["staged_at"] > timedelta(minutes=10):
+            del _staged_trades[confirmation_code]
+            return {
+                "status": "error",
+                "message": "Confirmation code has expired. Please stage the trade again.",
+            }
+        
+        # Execute the trade
+        result = alpaca_broker.place_order(
+            staged["account_id"],
+            staged["symbol"],
+            staged["side"],
+            staged["quantity"]
+        )
+        
+        # Remove staged trade after successful execution
+        del _staged_trades[confirmation_code]
+        
+        return result
+        
+    except Exception as e:
+        logger.exception(f"Failed to execute trade with code {confirmation_code}")
+        return {
+            "status": "error",
+            "message": f"Failed to execute trade: {str(e)}",
+        }
+
+
+@mcp.tool
+@_trace_tool_call
 def get_positions(account_id: str) -> list[dict]:
     """
     Get all open positions for the Alpaca paper trading account.
@@ -152,6 +432,7 @@ def get_positions(account_id: str) -> list[dict]:
 
 
 @mcp.tool
+@_trace_tool_call
 def get_account_summary(account_id: str) -> dict:
     """
     Get a full account summary for the Alpaca paper trading account: cash
@@ -170,6 +451,7 @@ def get_account_summary(account_id: str) -> dict:
 
 
 @mcp.tool
+@_trace_tool_call
 def get_order_history(account_id: str, limit: int = 50) -> list[dict]:
     """
     Get recent orders for the Alpaca paper trading account, most recent first.
@@ -187,6 +469,7 @@ def get_order_history(account_id: str, limit: int = 50) -> list[dict]:
 
 
 @mcp.tool
+@_trace_tool_call
 def get_balance(account_id: str) -> dict:
     """
     Get the current cash balance and buying power for the Alpaca paper 
@@ -203,6 +486,7 @@ def get_balance(account_id: str) -> dict:
 
 
 @mcp.tool
+@_trace_tool_call
 def get_current_user() -> dict:
     """
     Get information about the currently authenticated end user accessing the MCP server.
@@ -250,7 +534,8 @@ def get_current_user() -> dict:
 
 
 @mcp.tool
-def add_to_watchlist(symbol: str) -> dict:
+@_trace_tool_call
+def add_to_watchlist(symbol: str, email: str = 'valeria.s.caras@gmail.com') -> dict:
     """
     Add a stock to the watchlist by fetching its current quote from Massive.com
     and storing it in the Lakebase watchlist table.
@@ -265,7 +550,7 @@ def add_to_watchlist(symbol: str) -> dict:
     """
     try:
         # Get the actual end user's email (not the service principal)
-        user_email = _get_end_user_email()
+        user_email = email
         
         # Get quote from Massive.com
         quote = massive_broker.get_quote(symbol)
@@ -304,6 +589,7 @@ def add_to_watchlist(symbol: str) -> dict:
 
 
 @mcp.tool
+@_trace_tool_call
 def get_watchlist(limit: int = 100, email: str = 'zach@dataexpert.io') -> dict:
     """
     Retrieve all stocks in the authenticated user's watchlist from Lakebase.
@@ -347,6 +633,7 @@ def get_watchlist(limit: int = 100, email: str = 'zach@dataexpert.io') -> dict:
 
 
 @mcp.tool
+@_trace_tool_call
 def remove_from_watchlist(symbol: str) -> dict:
     """
     Remove a stock from the authenticated user's watchlist.
@@ -395,9 +682,76 @@ def remove_from_watchlist(symbol: str) -> dict:
 
 
 @mcp.tool
-def vector_search(query: str, limit: int = 10, search_chunks: bool = True) -> dict:
+@_trace_tool_call
+def get_mcp_traces(session_id: str = None, limit: int = 100) -> dict:
     """
-    Semantic search over ticker news using vector embeddings.
+    Retrieve MCP tool call traces from Lakebase for monitoring and debugging.
+    
+    Args:
+        session_id: Optional session ID to filter traces (if None, returns recent traces)
+        limit: Maximum number of traces to return (default 100)
+    
+    Returns:
+        A dict with traces, including tool names, parameters, results, and durations
+    """
+    try:
+        if session_id:
+            sql = """
+            SELECT 
+                id,
+                session_id,
+                user_email,
+                tool_name,
+                input_params,
+                output_result,
+                status,
+                error_message,
+                duration_ms,
+                created_at
+            FROM mcp_tool_traces
+            WHERE session_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+            """
+            rows = lakebase.run_query(sql, (session_id, limit))
+        else:
+            sql = """
+            SELECT 
+                id,
+                session_id,
+                user_email,
+                tool_name,
+                input_params,
+                output_result,
+                status,
+                error_message,
+                duration_ms,
+                created_at
+            FROM mcp_tool_traces
+            ORDER BY created_at DESC
+            LIMIT %s
+            """
+            rows = lakebase.run_query(sql, (limit,))
+        
+        return {
+            "status": "success",
+            "count": len(rows),
+            "session_id_filter": session_id,
+            "traces": rows,
+        }
+    except Exception as e:
+        logger.exception("Failed to retrieve traces")
+        return {
+            "status": "error",
+            "message": f"Failed to retrieve traces: {str(e)}",
+        }
+
+
+@mcp.tool
+@_trace_tool_call
+def get_stock_information(stock_query: str, limit: int = 10, search_chunks: bool = True) -> dict:
+    """
+    Queries information of a given stock.
     
     Accepts a text query, computes its embedding, and returns the most similar
     documents and chunks from Lakebase using pgvector's cosine similarity.
@@ -410,13 +764,13 @@ def vector_search(query: str, limit: int = 10, search_chunks: bool = True) -> di
     Returns:
         A dict with query, documents, chunks, and model name
     """
-    if not query or not query.strip():
+    if not stock_query or not stock_query.strip():
         return {"error": "Query text is required"}
     
     try:
         # Compute embedding for the query
         model = get_embedding_model()
-        query_embedding = model.encode(query)
+        query_embedding = model.encode(stock_query)
         
         # Convert to list for JSON serialization and postgres array format
         embedding_list = query_embedding.tolist()
@@ -467,7 +821,7 @@ def vector_search(query: str, limit: int = 10, search_chunks: bool = True) -> di
             )
         
         return {
-            "query": query,
+            "query": stock_query,
             "documents": doc_results,
             "chunks": chunk_results,
             "model": EMBEDDING_MODEL
@@ -479,6 +833,9 @@ def vector_search(query: str, limit: int = 10, search_chunks: bool = True) -> di
 
 
 if __name__ == "__main__":
+    # Initialize the tracing table
+    _init_tracing_table()
+    
     # Add middleware to capture request headers for end-user identity
     # This must be done before mcp.run() is called
     if hasattr(mcp, 'app') and mcp.app is not None:
